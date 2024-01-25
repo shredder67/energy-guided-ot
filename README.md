@@ -1,3 +1,14 @@
-# Energy-guided EOT
+# 🔥 Energy-guided EOT
 
-Learning energy based model guided by optimal transport to obtain conditional plan both from X to Y and from Y to X.  
+Learning Energy Based Model guided by Entropic Optimal Transport to learn joint plan $\pi_\theta(x, y)$, which allows to sample jointly close $x$ and $y$ or from conditional projections $\pi_\theta(x | y)$ and $\pi_\theta(y | x)$ as a result of training a single EBM.
+
+## Structure
+
+- ```theory.ipynb``` - notebook with theoretical introduction and derivations
+- ```gauss_swissroll_experiments.ipynb``` - implementation of experiment with 2D-Gaussian dataset and Swissroll
+
+## Visual Results
+
+...
+
+License: **MIT**

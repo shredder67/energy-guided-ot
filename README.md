@@ -4,8 +4,8 @@ Learning Energy Based Model guided by Entropic Optimal Transport to learn joint 
 
 ## Structure
 
-- ```theory.ipynb``` - notebook with theoretical introduction and derivations
-- ```gauss_swissroll_experiments.ipynb``` - implementation of experiment with 2D-Gaussian dataset and Swissroll
+- ```notebooks/theory.ipynb``` - notebook with theoretical introduction and derivations
+- ```notebooks/gauss_swissroll_experiments.ipynb``` - implementation of experiment with 2D-Gaussian dataset and Swissroll
 
 ## Visual Results
 

@@ -31,9 +31,11 @@ COST_COEFFICIENT = 0.0
 
 # ebm training parameters
 ALPHA = 0.001
-ENERGY_SAMPLING_STEP = 1.0
+ENERGY_SAMPLING_STEP = 1.0  # langevin step, keep const 1.
 ENERGY_SAMPLING_ITERATIONS = 100
-LANGEVIN_SAMPLING_NOISE = 0.025
+LANGEVIN_SAMPLING_NOISE = 0.025  # sampling noise coef. at each step
+REFERENCE_DATA_NOISE_SIGMA = 0.05  # smoothing noise
+
 
 # sample buffer setup
 SAMPLE_BUFFER_TYPE = 'static'
@@ -173,12 +175,22 @@ class SimpleConvNetHard(nn.Module):
             ]
         )
 
-    def forward(self, input : torch.Tensor):
-        inp1, inp2 = torch.chunk(input, 2, 1)
+    def forward(self, input: torch.Tensor):
+        inp1, inp2 = torch.chunk(input, 2, 1) # split X, Y (paired input)
         out1, out2 = self.fin_blocks1(self.block_joint(inp1)), self.fin_blocks2(self.block_joint(inp2))
         # u(x) + v(y) - c(x, y)
         res = out1 + out2 - COST(inp1, inp2)
 
+        return res
+    
+    def cond_forward(self, input: torch.Tensor, condition_on='x'):
+        x, y = torch.chunk(input, 2, 1)  # split X, Y (paired input)
+        if condition_on == 'x':
+            out = self.fin_blocks2(self.block_joint(y))
+        elif condition_on == 'y':
+            out = self.fin_blocks1(self.block_joint(x))
+        
+        res = out - COST(x, y)
         return res
 
 #2. ...
@@ -202,6 +214,7 @@ class SampleBufferGeneric:
     
     def __call__(self, Xs : torch.Tensor) -> Tuple[torch.Tensor, Optional[Sequence]]:
         raise NotImplementedError()
+
 
 class SampleBufferIGEBM(SampleBufferGeneric):
 
@@ -277,6 +290,7 @@ class SampleBufferStatic(SampleBufferGeneric):
     def __call__(self, Xs):
         return self.get(len(Xs), device=Xs.device)
 
+
 def initialize_sample_buffer() -> SampleBufferGeneric:
     if SAMPLE_BUFFER_TYPE == 'static':
         Xs_init = torch.rand(SAMPLE_BUFFER_PARAMS['static']['size'], INP_CHANS, INP_SPAT[0], INP_SPAT[1])
@@ -323,80 +337,138 @@ def clip_grad(parameters, optimizer):
                 bound = 3 * torch.sqrt(exp_avg_sq / (1 - beta2 ** step)) + 0.1
                 p.grad.data.copy_(torch.max(torch.min(p.grad.data, bound), -bound))
 
-################################################################################################################
-################################################################################################################
-# Training
 
-model = SimpleConvNetHard().to(DEVICE)
-dataset = CMNISTPairedDataset(
-    train=True, spat_dim=INP_SPAT, download=False, dummy_class=False, root=DATASET_DATA_PATH)
-loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
-loader = tqdm(enumerate(sample_data(loader)))
+# Inference Sampling
 
-sample_buffer = initialize_sample_buffer()
-
-noise = torch.randn(BATCH_SIZE, INP_CHANS, INP_SPAT[0], INP_SPAT[1], device=DEVICE)
-
-parameters = model.parameters()
-optimizer = optim.Adam(parameters, lr=LR, betas=(0.0, 0.999))
-
-for i, pos_img in loader:
-    pos_img = pos_img.to(DEVICE)
-    neg_img, neg_ids = sample_buffer(pos_img)
-
-    neg_img.requires_grad = True
-
+def sample_joint(model: nn.Module, paired_init_data: torch.Tensor, n_steps=ENERGY_SAMPLING_ITERATIONS, step_size=ENERGY_SAMPLING_STEP, noise_coef=LANGEVIN_SAMPLING_NOISE):
+    model_is_training = model.trianing
+    if model_is_training:
+        model.eval()
+    
+    parameters = model.parameters()
     requires_grad(parameters, False)
-    model.eval()
-
-    for k in tqdm(range(ENERGY_SAMPLING_ITERATIONS)):
+    
+    cur_sample = paired_init_data.clone()
+    cur_sample.requires_grad = True
+    for k in tqdm(range(n_steps)):
         if noise.shape[0] != neg_img.shape[0]:
             noise = torch.randn(neg_img.shape[0], INP_CHANS, INP_SPAT[0], INP_SPAT[1], device=DEVICE)
 
-        noise.normal_(0, LANGEVIN_SAMPLING_NOISE)
+        noise.normal_(0, noise_coef)
 
-        neg_out = model(neg_img)
-        neg_out.sum().backward()
-        neg_img.grad.data.clamp_(-0.01, 0.01)
+        out = model(neg_img)
+        out.sum().backward()
+        cur_sample.grad.data.clamp_(-0.01, 0.01)
 
-        neg_img.data.add_(neg_img.grad.data, alpha=-ENERGY_SAMPLING_STEP)
-        neg_img.data.add_(noise.data)
+        cur_sample.data.add_(cur_sample.grad.data, alpha=-ENERGY_SAMPLING_STEP)
+        cur_sample.data.add_(noise.data)
 
-        neg_img.grad.detach_()
-        neg_img.grad.zero_()
+        cur_sample.grad.detach_()
+        cur_sample.grad.zero_()
 
-        neg_img.data.clamp_(0, 1)
+        cur_sample.data.clamp_(0, 1)
 
-    neg_img = neg_img.detach()
+    cur_sample = cur_sample.detach()
 
     requires_grad(parameters, True)
-    model.train()
     model.zero_grad()
+    
+    if model_is_training:
+        model.train()
+    
+    return cur_sample
 
-    pos_out = model(pos_img)
-    neg_out = model(neg_img)
+def sample_conditional(model: nn.Module, init_point: torch.Tensor, condition_on='x', n_steps=ENERGY_SAMPLING_ITERATIONS, step_size=ENERGY_SAMPLING_STEP, noise_coef=LANGEVIN_SAMPLING_NOISE):
+    model_is_training = model.trianing
+    if model_is_training:
+        model.eval()
+    
+    parameters = model.parameters()
+    requires_grad(parameters, False)
+    
+    if condition_on == 'x':
+        cur_sample = torch.cat([init_point, torch.randn_like(init_point, device=init_point.device)], dim=1)
+    elif condition_on == 'y':
+        cur_sample = torch.cat([torch.randn_like(init_point, device=init_point.device), init_point], dim=1)
+    
+    cur_sample.requires_grad = True
+    for k in tqdm(range(n_steps)):
+        if noise.shape[0] != neg_img.shape[0]:
+            noise = torch.randn(neg_img.shape[0], INP_CHANS, INP_SPAT[0], INP_SPAT[1], device=DEVICE)
 
-    loss = ALPHA * (pos_out ** 2 + neg_out ** 2)
-    loss = loss + (pos_out - neg_out)
-    loss = loss.mean()
-    loss.backward()
+        noise.normal_(0, noise_coef)
 
-    clip_grad(parameters, optimizer)
+        out = model.cond_forward(neg_img, condition_on)
+        out.sum().backward()
+        cur_sample.grad.data.clamp_(-0.01, 0.01)
 
-    optimizer.step()
+        cur_sample.data.add_(cur_sample.grad.data, alpha=-ENERGY_SAMPLING_STEP)
+        cur_sample.data.add_(noise.data)
 
-    sample_buffer.push(neg_img, neg_ids)
+        cur_sample.grad.detach_()
+        cur_sample.grad.zero_()
 
-    loader.set_description(f'loss: {loss.item():.5f}')
+        cur_sample.data.clamp_(0, 1)
 
-    if i % 50 == 0:
-        neg_imgX, neg_imgY = torch.chunk(neg_img, 2, 1)
-        for suff, img in zip(['X', 'Y'], [neg_imgX, neg_imgY]):
-            TVutils.save_image(
-                img.detach().to('cpu'),
-                f'{SAMPLES_DIR}/{str(i).zfill(5)}_{suff}.png',
-                nrow=16,
-                normalize=True,
-                range=(0, 1),
-            )
+    cur_sample = cur_sample.detach()
+
+    requires_grad(parameters, True)
+    model.zero_grad()
+    
+    if model_is_training:
+        model.train()
+    
+    return cur_sample
+
+################################################################################################################
+################################################################################################################
+# Training
+                
+if __name__ == '__main__':
+    model = SimpleConvNetHard().to(DEVICE)
+    dataset = CMNISTPairedDataset(
+        train=True, spat_dim=INP_SPAT, download=False, dummy_class=False, root=DATASET_DATA_PATH)
+    loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True, num_workers=4)
+    loader = tqdm(enumerate(sample_data(loader)))
+
+    sample_buffer = initialize_sample_buffer()
+
+    noise = torch.randn(BATCH_SIZE, INP_CHANS, INP_SPAT[0], INP_SPAT[1], device=DEVICE)
+
+    parameters = model.parameters()
+    optimizer = optim.Adam(parameters, lr=LR, betas=(0.0, 0.999))
+
+    for i, pos_img in loader:
+        pos_img = pos_img.to(DEVICE)
+        # pos_img += REFERENCE_DATA_NOISE_SIGMA * torch.randn_like(pos_img) # used in no-cost setup
+        # pos_img.clamp_(0, 1)
+        neg_img, neg_ids = sample_buffer(pos_img)
+        neg_img = sample_joint(model, neg_img)
+
+        pos_out = model(pos_img)
+        neg_out = model(neg_img)
+
+        loss = ALPHA * (pos_out ** 2 + neg_out ** 2)
+        loss = loss + (pos_out - neg_out)
+        loss = loss.mean()
+        loss.backward()
+
+        clip_grad(parameters, optimizer)
+
+        optimizer.step()
+
+        sample_buffer.push(neg_img, neg_ids)
+
+        loader.set_description(f'loss: {loss.item():.5f}')
+
+        if i % 50 == 0:
+            neg_imgX, neg_imgY = torch.chunk(neg_img, 2, 1)
+            for suff, img in zip(['X', 'Y'], [neg_imgX, neg_imgY]):
+                TVutils.save_image(
+                    img.detach().to('cpu'),
+                    f'{SAMPLES_DIR}/{str(i).zfill(5)}_{suff}.png',
+                    nrow=16,
+                    normalize=True,
+                    range=(0, 1),
+                )
 
